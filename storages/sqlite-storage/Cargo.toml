@@ -15,8 +15,8 @@ description = "SQLite storage backend for whatsapp-rust"
 ignored = ["libsqlite3-sys", "sqlite-wasm-rs"]
 
 [features]
-default = ["bundled-sqlite"]
-bundled-sqlite = ["libsqlite3-sys/bundled"]
+default = []
+# bundled-sqlite = ["libsqlite3-sys/bundled"]
 test-util = []
 # The browser host on wasm32-unknown-unknown: wacore's JS randomness and
 # sqlite-wasm-rs's wasm-bindgen hooks, which the 0.6 ABI Diesel accepts no
@@ -33,7 +33,7 @@ buffa = { workspace = true }
 bytes = { workspace = true }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
-libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
+# libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
 log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
