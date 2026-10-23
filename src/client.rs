@@ -755,6 +755,19 @@ pub struct MemoryReport {
     /// Bounded by the number of collections in practice, but retained until a
     /// reply consumes the entry, so it is reported rather than assumed small.
     pub app_state_recovery_requests: usize,
+    /// Snapshot recoveries the primary sent unasked, queued behind the one
+    /// being applied.
+    ///
+    /// Bounded at 64 replies, plus the one in flight. Reads 0 until the first
+    /// recovery reply builds the state that holds them.
+    pub app_state_unrequested_recoveries_queued: usize,
+    /// Wire bytes the queued unrequested recoveries hold.
+    ///
+    /// Bounded by `wacore::history_sync::MAX_DECOMPRESSED`, except that one
+    /// reply of up to the slightly larger compressed wire ceiling may always
+    /// wait alone; the reply in flight is not counted. Reads 0 until the first
+    /// recovery reply builds the state that holds them.
+    pub app_state_unrequested_recoveries_queued_bytes: u64,
     pub app_state_syncing: usize,
     /// Synced audience retention. `entries` counts top-level JIDs, custom-list
     /// records, and JIDs inside those lists. `bytes` attributes the shared
@@ -881,7 +894,8 @@ impl MemoryReport {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
         let total = total
             .saturating_add(self.inbound_chat_charged_bytes)
-            .saturating_add(self.inbound_ack_charged_bytes);
+            .saturating_add(self.inbound_ack_charged_bytes)
+            .saturating_add(self.app_state_unrequested_recoveries_queued_bytes);
         let total = self.subsystems.iter().fold(total, |sum, retained| {
             sum.saturating_add(retained.stats.bytes)
         });
@@ -938,6 +952,10 @@ impl MemoryReport {
             (
                 "app_state_recovery_requests",
                 n(self.app_state_recovery_requests),
+            ),
+            (
+                "app_state_unrequested_recoveries_queued",
+                n(self.app_state_unrequested_recoveries_queued),
             ),
             ("app_state_syncing", n(self.app_state_syncing)),
             ("status_privacy", self.status_privacy.entries),
@@ -1069,6 +1087,12 @@ impl std::fmt::Display for MemoryReport {
             f,
             "  app_state_recovery:     {}",
             self.app_state_recovery_requests
+        )?;
+        writeln!(
+            f,
+            "  app_state_unrequested_recoveries: {} ({} B)",
+            self.app_state_unrequested_recoveries_queued,
+            self.app_state_unrequested_recoveries_queued_bytes
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         line(f, "status_privacy:", &self.status_privacy)?;
@@ -2070,6 +2094,11 @@ pub struct Client {
     /// are user-paced, so there is nothing to gain from finer granularity.
     /// Inline: only ever locked via `&self` on the `Arc`-held `Client`.
     pub(crate) app_state_send_lock: Mutex<()>,
+    /// The state behind snapshot recoveries from the primary, built when the
+    /// first recovery reply arrives. Most clients never receive one, so they
+    /// pay for this cell and nothing else; what it holds, and why, is on
+    /// `crate::pdo::SnapshotRecoveryState`.
+    pub(crate) snapshot_recovery: std::sync::OnceLock<Box<crate::pdo::SnapshotRecoveryState>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 
