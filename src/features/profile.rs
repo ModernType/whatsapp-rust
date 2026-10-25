@@ -4,12 +4,15 @@
 
 use super::chat_actions::AppStateError;
 use crate::client::{Client, ClientError};
+use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
 use crate::store::commands::DeviceCommand;
 use anyhow::Result;
 use log::debug;
+use std::time::Duration;
 use thiserror::Error;
 use wacore::iq::contacts::SetProfilePictureSpec;
+use wacore::iq::mex_operations::update_text_status;
 use wacore::iq::profile::SetStatusTextSpec;
 use wacore_binary::builder::NodeBuilder;
 
@@ -25,6 +28,9 @@ pub enum ProfileError {
     /// Connection/transport failure sending a stanza (push-name presence).
     #[error("{0}")]
     Client(#[from] ClientError),
+    /// A MEX request failed (text status).
+    #[error("{0}")]
+    Mex(#[from] MexError),
     /// Picture data was empty; use the dedicated removal operation instead.
     #[error("picture data cannot be empty; use remove_profile_picture instead")]
     EmptyPicture,
@@ -53,6 +59,60 @@ pub enum PushNameOutcome {
     },
 }
 
+/// How long a text status stays visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TextStatusExpiry {
+    /// Stays until it is replaced or cleared. WhatsApp Web sends `-1`.
+    Never,
+    /// Disappears after this long. Must be at least one second.
+    After(Duration),
+}
+
+/// Duration WhatsApp Web sends for a text status that never expires.
+const TEXT_STATUS_NEVER: i64 = -1;
+
+/// Build the `input` variable of `WAWebMexUpdateTextStatusJobMutation`.
+///
+/// The server refuses a zero duration together with text or an emoji (`400`),
+/// so an expiring status needs at least one second. Clearing is the one case
+/// that sends zero: a null text and no emoji, exactly as WhatsApp Web does.
+fn text_status_input(
+    text: Option<&str>,
+    emoji: Option<&str>,
+    expiry: TextStatusExpiry,
+) -> Result<serde_json::Value, ProfileError> {
+    let text = text.map(str::trim).filter(|t| !t.is_empty());
+    let emoji = emoji.map(str::trim).filter(|e| !e.is_empty());
+    if text.is_none() && emoji.is_none() {
+        return Err(ProfileError::InvalidArgument(
+            "a text status needs text or an emoji; use clear_text_status to remove it".into(),
+        ));
+    }
+    let seconds = match expiry {
+        TextStatusExpiry::Never => TEXT_STATUS_NEVER,
+        TextStatusExpiry::After(after) => {
+            let seconds = after.as_secs();
+            if seconds == 0 {
+                return Err(ProfileError::InvalidArgument(
+                    "a text status must last at least one second".into(),
+                ));
+            }
+            i64::try_from(seconds).map_err(|_| {
+                ProfileError::InvalidArgument("text status duration is too large".into())
+            })?
+        }
+    };
+    let mut input = serde_json::json!({
+        "text": text,
+        "ephemeral_duration_sec": seconds,
+    });
+    if let Some(emoji) = emoji {
+        input["emoji"] = serde_json::json!({ "content": emoji });
+    }
+    Ok(input)
+}
+
 /// Feature handle for profile operations.
 pub struct Profile<'a> {
     client: &'a Client,
@@ -72,12 +132,69 @@ impl<'a> Profile<'a> {
     /// </iq>
     /// ```
     ///
-    /// Note: This sets the profile "About" text, not ephemeral text status updates.
+    /// The server accepts this and even reads the new text back, but current
+    /// phone apps ignore it, so the About shown on the phone does not change.
+    /// Use [`Self::set_text_status`], which is what WhatsApp Web sends today.
     pub async fn set_status_text(&self, text: &str) -> Result<(), ProfileError> {
         debug!("Setting status text (length={})", text.len());
 
         self.client.execute(SetStatusTextSpec::new(text)).await?;
 
+        Ok(())
+    }
+
+    /// Set the user's About / text status, with an optional emoji.
+    ///
+    /// Sends `WAWebMexUpdateTextStatusJobMutation`, the request WhatsApp Web
+    /// uses, so the phone app shows the change. Pass [`TextStatusExpiry::Never`]
+    /// for a permanent About. Use [`Self::clear_text_status`] to remove it.
+    ///
+    /// The generated variables type for this operation is a plain string, but
+    /// the server expects an object, so the request goes through `raw_request`.
+    pub async fn set_text_status(
+        &self,
+        text: &str,
+        emoji: Option<&str>,
+        expiry: TextStatusExpiry,
+    ) -> Result<(), ProfileError> {
+        let input = text_status_input(Some(text), emoji, expiry)?;
+        debug!("Setting text status (length={})", text.len());
+        self.send_text_status(input).await
+    }
+
+    /// Remove the user's text status.
+    ///
+    /// Sends a null text with a zero duration, as WhatsApp Web does.
+    pub async fn clear_text_status(&self) -> Result<(), ProfileError> {
+        debug!("Clearing text status");
+        self.send_text_status(serde_json::json!({
+            "text": null,
+            "ephemeral_duration_sec": 0,
+        }))
+        .await
+    }
+
+    async fn send_text_status(&self, input: serde_json::Value) -> Result<(), ProfileError> {
+        let response = self
+            .client
+            .mex()
+            .execute(mex_request!(
+                update_text_status,
+                serde_json::json!({ "input": input })
+            ))
+            .await?;
+        let result = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("xwa2_update_text_status"))
+            .and_then(|status| status.get("result"))
+            .and_then(|result| result.as_str());
+        if result != Some("SUCCESS") {
+            return Err(MexError::PayloadParsing(format!(
+                "text status update failed, result: {result:?}"
+            ))
+            .into());
+        }
         Ok(())
     }
 
@@ -360,5 +477,161 @@ mod tests {
                 .as_deref(),
             Some("Retry Name")
         );
+    }
+
+    #[test]
+    fn text_status_input_matches_what_whatsapp_web_sends() {
+        let input =
+            text_status_input(Some(" Open "), Some("\u{1f680}"), TextStatusExpiry::Never).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "text": "Open",
+                "emoji": { "content": "\u{1f680}" },
+                "ephemeral_duration_sec": -1,
+            })
+        );
+
+        let input = text_status_input(
+            Some("Away"),
+            None,
+            TextStatusExpiry::After(Duration::from_secs(86_400)),
+        )
+        .unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({ "text": "Away", "ephemeral_duration_sec": 86_400 })
+        );
+    }
+
+    #[test]
+    fn text_status_input_rejects_what_the_server_refuses() {
+        assert!(matches!(
+            text_status_input(Some("  "), None, TextStatusExpiry::Never),
+            Err(ProfileError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            text_status_input(Some("Hi"), None, TextStatusExpiry::After(Duration::ZERO)),
+            Err(ProfileError::InvalidArgument(_))
+        ));
+    }
+
+    fn mex_answer(id: &str, body: &str) -> wacore_binary::Node {
+        use wacore_binary::builder::NodeBuilder;
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", id)
+            .children([NodeBuilder::new("result")
+                .bytes(body.as_bytes().to_vec())
+                .build()])
+            .build()
+    }
+
+    /// Run `call` against the test client, answer its single MEX IQ with `body`
+    /// and hand back the variables the request carried and the call's result.
+    async fn text_status_round_trip<F, Fut>(
+        body: &str,
+        call: F,
+    ) -> (serde_json::Value, Result<(), ProfileError>)
+    where
+        F: FnOnce(std::sync::Arc<Client>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), ProfileError>> + Send + 'static,
+    {
+        let (client, transport) = create_iq_test_client().await;
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { call(client).await })
+        };
+
+        let sent = decode_sent_iq(&transport, 0).await;
+        let sent = sent.get();
+        let query = sent.get_optional_child("query").expect("mex query node");
+        assert_eq!(
+            query.attrs().optional_string("query_id").as_deref(),
+            Some(update_text_status::DOC_ID)
+        );
+        let payload = match query.content.as_ref() {
+            Some(wacore_binary::NodeContentRef::Bytes(bytes)) => bytes.to_vec(),
+            _ => panic!("mex payload should be bytes"),
+        };
+        let id = sent
+            .attrs()
+            .optional_string("id")
+            .expect("iq id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &id, &mex_answer(&id, body)).await;
+
+        let result = request.await.expect("task");
+        let payload: serde_json::Value = serde_json::from_slice(&payload).expect("json payload");
+        (payload, result)
+    }
+
+    const TEXT_STATUS_OK: &str = r#"{"data":{"xwa2_update_text_status":{"result":"SUCCESS"}}}"#;
+
+    #[tokio::test]
+    async fn set_text_status_sends_an_object_input_and_accepts_success() {
+        let (payload, result) = text_status_round_trip(TEXT_STATUS_OK, |client| async move {
+            client
+                .profile()
+                .set_text_status("Open", Some("\u{1f680}"), TextStatusExpiry::Never)
+                .await
+        })
+        .await;
+        result.expect("SUCCESS answer");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "variables": {
+                    "input": {
+                        "text": "Open",
+                        "emoji": { "content": "\u{1f680}" },
+                        "ephemeral_duration_sec": -1,
+                    }
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_text_status_sends_a_null_text_and_a_zero_duration() {
+        let (payload, result) = text_status_round_trip(TEXT_STATUS_OK, |client| async move {
+            client.profile().clear_text_status().await
+        })
+        .await;
+        result.expect("SUCCESS answer");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "variables": { "input": { "text": null, "ephemeral_duration_sec": 0 } }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_failed_result_is_an_error() {
+        for body in [
+            r#"{"data":{"xwa2_update_text_status":{}}}"#,
+            r#"{"data":{"xwa2_update_text_status":{"result":"FAILED"}}}"#,
+            r#"{"data":null}"#,
+        ] {
+            let (_, result) = text_status_round_trip(body, |client| async move {
+                client.profile().clear_text_status().await
+            })
+            .await;
+            assert!(
+                matches!(result, Err(ProfileError::Mex(MexError::PayloadParsing(_)))),
+                "{body} should be refused, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fatal_mex_error_is_returned() {
+        let (_, result) = text_status_round_trip(
+            r#"{"data":null,"errors":[{"message":"Bad Request","extensions":{"error_code":400}}]}"#,
+            |client| async move { client.profile().clear_text_status().await },
+        )
+        .await;
+        assert!(matches!(result, Err(ProfileError::Mex(_))), "{result:?}");
     }
 }
