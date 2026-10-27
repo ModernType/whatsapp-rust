@@ -28,3 +28,14 @@ lookup tests stay in `tests/group_lookup_contract.rs`; call-action parser/wire
 checks stay in `wacore/tests/call_action_public.rs`. Historical module aliases no
 longer need repeated negative proofs; the removed peer-video variant keeps one
 directed diagnostic control. Domain bins retain portable link probes.
+
+See the [support matrix](../../agent_docs/support.md) for target/runtime qualification.
+
+`host_shutdown_budget` demonstrates retaining shutdown across a host deadline and
+waiting for storage ownership to release. `bounded_plugin_workers` demonstrates
+bounded admission, shared payloads and cooperative drain/cancellation. Run both:
+
+```sh
+cargo test --manifest-path tests/api-consumer/Cargo.toml --no-default-features \
+  --features native,plugins --test host_shutdown_budget --test bounded_plugin_workers
+```

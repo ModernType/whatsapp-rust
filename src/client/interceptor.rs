@@ -1,8 +1,8 @@
 //! Taking over a stanza before the built-in pipeline sees it.
 //!
 //! The client models the stanzas it knows about and nacks the rest, which is
-//! the right default: a `<nack>` tells the server this client cannot act on
-//! something, and silence would leave the stanza in the offline queue forever.
+//! the default for a tag it cannot handle: a `<nack>` reports that limitation.
+//! The local response does not establish the server's redelivery policy.
 //!
 //! But it leaves no room for a consumer that *can* act on it. A stanza this
 //! version does not model gets nacked whether or not the application would have
@@ -53,23 +53,18 @@
 //!
 //! # Acknowledgement
 //!
-//! A claim does not change what the server is owed. Where the client would have
-//! acked, it still acks; where it would have nacked a tag it does not model,
-//! the claim turns that into an ack, because someone did handle it — answering
-//! nothing would leave the stanza in the offline queue and keep the stream
-//! recycling. Both need `id` and `from`: without them there is nothing to
-//! address, and the client would not have answered either.
+//! Claims preserve the response class:
 //!
-//! A tag the client *does* model but answers some other way is answered by
-//! nobody once claimed. A direct `<message>` draws a delivery `<receipt>` and
-//! an `<iq>` draws an `<iq type="result">`; a generic `<ack>` is neither, so
-//! the client does not send one. Claiming those means owing the reply.
+//! - Direct/group messages and IQ requests receive no generic ACK. The claimant
+//!   owns decryption/session state and the appropriate receipt or IQ response.
+//! - Newsletter/status messages, receipts, notifications, calls and unknown tags
+//!   receive a transport ACK when `id` and `from` are present. Message/status ACKs
+//!   also require the local device PN. This SDK fallback is not a Web-equivalence
+//!   or server redelivery guarantee.
 //!
-//! `<receipt>`, `<notification>` and `<call>` are not in that group: the client
-//! answers those with a transport `<ack>` already, so a claim leaves the ack
-//! exactly where it was. When a group notification durability hook is configured,
-//! its commit gate runs first: a failed or stale capture reaches neither
-//! interceptors nor the ACK path.
+//! A configured group notification capture must commit before interception and
+//! ACK. Failed or retired captures reach neither path. An ACK does not establish
+//! application persistence.
 //!
 //! # Cost
 //!
@@ -112,6 +107,27 @@ use wacore::sync_marker::MaybeSendSync;
 use wacore_binary::node::OwnedNodeRef;
 
 use crate::Client;
+
+/// Connection identity passed by the dispatcher to scoped interceptors.
+///
+/// Its fields are private so a caller cannot manufacture an inbound reply grant.
+#[doc(hidden)]
+pub struct InterceptionScope {
+    pub(crate) generation: u64,
+    pub(crate) shutdown: wacore::runtime::ShutdownSignal,
+}
+
+impl InterceptionScope {
+    /// Connection generation captured by the dispatcher.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether that connection has requested cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.shutdown.is_fired()
+    }
+}
 
 /// What an interceptor decided about a stanza.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -156,6 +172,13 @@ impl Interception {
 pub trait StanzaInterceptor: MaybeSendSync + 'static {
     /// Decide what happens to `node`.
     fn intercept(&self, node: &OwnedNodeRef) -> Interception;
+
+    /// Dispatcher hook for connection-bound capabilities. Existing interceptors
+    /// use `intercept`; the default preserves their behavior.
+    #[doc(hidden)]
+    fn intercept_scoped(&self, node: &OwnedNodeRef, _scope: &InterceptionScope) -> Interception {
+        self.intercept(node)
+    }
 }
 
 impl<F> StanzaInterceptor for F

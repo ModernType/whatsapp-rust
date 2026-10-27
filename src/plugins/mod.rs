@@ -1,6 +1,10 @@
 //! Build-time client plugins and their capability-scoped host.
 
 mod events;
+mod iq_reply;
+
+use iq_reply::PluginIqInterceptorAdapter;
+pub use iq_reply::{PluginIqInterceptor, PluginIqReply};
 
 pub use events::{
     PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
@@ -32,7 +36,9 @@ use wacore_binary::Jid;
 use waproto::whatsapp::Message;
 
 use crate::Client;
-use crate::client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
+use crate::client::interceptor::{
+    Interception, InterceptionScope, InterceptorHandle, StanzaInterceptor,
+};
 use crate::client::{
     ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease,
     EncDecryptFailedLease, RawNodeLease, SentFrameLease,
@@ -48,6 +54,7 @@ const CAP_IQ: u64 = 1 << 3;
 const CAP_PLUGIN_EVENTS: u64 = 1 << 4;
 const CAP_STANZA_INTERCEPTION: u64 = 1 << 5;
 const CAP_CLIENT_INFO: u64 = 1 << 6;
+const CAP_IQ_REPLY: u64 = 1 << 7;
 const DEFAULT_PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +70,9 @@ pub enum PluginCapability {
     PluginEvents,
     StanzaInterception,
     ClientInfo,
+    /// Reply once to a claimed, authenticated inbound IQ request. Requires
+    /// `StanzaInterception` to register its handler.
+    IqReply,
 }
 
 impl PluginCapability {
@@ -75,6 +85,7 @@ impl PluginCapability {
             Self::PluginEvents => "events.plugin.publish",
             Self::StanzaInterception => "stanza.intercept",
             Self::ClientInfo => "client.info.read",
+            Self::IqReply => "iq.reply",
         }
     }
 
@@ -87,6 +98,7 @@ impl PluginCapability {
             Self::PluginEvents => CAP_PLUGIN_EVENTS,
             Self::StanzaInterception => CAP_STANZA_INTERCEPTION,
             Self::ClientInfo => CAP_CLIENT_INFO,
+            Self::IqReply => CAP_IQ_REPLY,
         }
     }
 }
@@ -282,6 +294,12 @@ pub enum PluginPlanError {
         plugin_id: String,
         dependency: String,
     },
+    #[error("plugin `{plugin_id}` capability {capability:?} requires {required:?}")]
+    MissingCapabilityDependency {
+        plugin_id: String,
+        capability: PluginCapability,
+        required: PluginCapability,
+    },
     #[error("plugin dependency cycle involves: {plugins:?}")]
     DependencyCycle { plugins: Vec<String> },
 }
@@ -316,6 +334,28 @@ pub enum PluginIqError {
     Resource(#[from] PluginResourceError),
     #[error("{0}")]
     Iq(#[from] IqError),
+}
+
+/// Failure to admit or send one inbound IQ reply.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PluginIqReplyError {
+    #[error("{0}")]
+    Resource(#[from] PluginResourceError),
+    #[error("the IQ reply capability was not requested")]
+    CapabilityRequired,
+    #[error("the interceptor did not claim this IQ")]
+    NotClaimed,
+    #[error("this IQ reply grant has already been used")]
+    AlreadyUsed,
+    #[error("the IQ's connection has retired")]
+    ConnectionRetired,
+    #[error("IQ error codes must be between 400 and 599")]
+    InvalidErrorCode,
+    #[error("IQ error text must not be empty")]
+    InvalidErrorText,
+    #[error("{0}")]
+    Send(#[from] crate::client::ClientError),
 }
 
 /// Lifecycle state of one installed plugin.
@@ -1331,22 +1371,84 @@ impl PluginCoreEvents {
 ///
 /// # What a claim skips
 ///
-/// Interception runs before the built-in pipeline, so a claimed stanza is one
-/// the client did no work on at all — no decryption, no session mutation, no
-/// prekey consumed. Signal state is untouched rather than half-advanced, which
-/// is what makes claiming safe to reason about; but it also means claiming a
-/// `<message>` leaves it undecrypted forever, since the ack that follows tells
-/// the server not to redeliver. A plugin that claims stanzas carrying Signal
-/// state takes over that responsibility whole. Match narrowly.
+/// A claim skips the built-in handler. Claiming a Signal message transfers
+/// decryption, session state and receipt handling to the plugin. Direct/group
+/// messages and IQ claims receive no generic ACK; other classes follow the rules in
+/// [`crate::client::interceptor`]. Claims do not establish server redelivery
+/// policy. Match narrowly.
 #[derive(Clone)]
 pub struct PluginStanzaInterception {
     client: Weak<Client>,
     resources: Arc<PluginResources>,
     plugin_id: Arc<str>,
     diagnostics: Arc<PluginDiagnostics>,
+    iq_reply_allowed: bool,
 }
 
 impl PluginStanzaInterception {
+    /// Register a narrowly matched inbound IQ handler with a one-use reply grant.
+    ///
+    /// Both `StanzaInterception` and `IqReply` must be declared. Only authenticated
+    /// `get`/`set` requests with nonempty `id` and valid `from` are offered here.
+    /// Pings, connection-critical stanzas and correlated responses remain owned
+    /// by the core. Returning `Handled` authorizes the grant; returning `Pass`
+    /// or panicking permanently rejects it. The callback runs inline and must
+    /// return promptly. Move the grant into a bounded worker for async work.
+    ///
+    /// A grant fixes the destination, ID and connection. It can send one result
+    /// with extension-defined children, or an error with a code/text pair. It
+    /// cannot initiate IQs, alter the envelope, access storage or send receipts.
+    /// `xmlns` must be present and the request must contain exactly one child;
+    /// pairing namespace `md` and ping payloads are excluded.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use whatsapp_rust::client::interceptor::Interception;
+    /// use whatsapp_rust::plugins::{PluginContext, PluginInterceptorRegistration, PluginIqReply};
+    /// use wacore_binary::node::OwnedNodeRef;
+    ///
+    /// // The plugin manifest declares StanzaInterception, IqReply and Tasks.
+    /// fn install(context: PluginContext) -> anyhow::Result<PluginInterceptorRegistration> {
+    ///     let (sender, receiver) = async_channel::bounded::<PluginIqReply>(8);
+    ///     context.tasks().ok_or_else(|| anyhow::anyhow!("Tasks required"))?
+    ///         .spawn(async move {
+    ///             // One worker. Host shutdown aborts it and drops queued grants.
+    ///             while let Ok(reply) = receiver.recv().await {
+    ///                 if let Err(error) = reply.result(Vec::new()).await {
+    ///                     log::debug!("extension reply incomplete: {error}");
+    ///                 }
+    ///             }
+    ///         })?;
+    ///     let registration = context.stanza_interception()
+    ///         .ok_or_else(|| anyhow::anyhow!("StanzaInterception required"))?
+    ///         .register_iq(Arc::new(move |node: &OwnedNodeRef, reply: PluginIqReply| {
+    ///             if node.get().get_attr("xmlns")
+    ///                 .is_some_and(|namespace| namespace.as_str() == "test:extension")
+    ///                 && sender.try_send(reply).is_ok()
+    ///             {
+    ///                 Interception::Handled
+    ///             } else {
+    ///                 // Full/closed queues decline ownership without blocking.
+    ///                 Interception::Pass
+    ///             }
+    ///         }))?;
+    ///     Ok(registration) // Retain this in the plugin's API.
+    /// }
+    /// ```
+    pub fn register_iq(
+        &self,
+        interceptor: Arc<dyn PluginIqInterceptor>,
+    ) -> Result<PluginInterceptorRegistration, PluginIqReplyError> {
+        if !self.iq_reply_allowed {
+            return Err(PluginIqReplyError::CapabilityRequired);
+        }
+        Ok(self.register(Arc::new(PluginIqInterceptorAdapter {
+            client: self.client.clone(),
+            resources: Arc::clone(&self.resources),
+            inner: interceptor,
+        }))?)
+    }
+
     /// Register `interceptor` for the life of the returned token.
     ///
     /// Dropping the token removes it, and host shutdown invalidates a token a
@@ -1390,6 +1492,21 @@ struct GuardedStanzaInterceptor {
 impl StanzaInterceptor for GuardedStanzaInterceptor {
     fn intercept(&self, node: &OwnedNodeRef) -> Interception {
         match std::panic::catch_unwind(AssertUnwindSafe(|| self.inner.intercept(node))) {
+            Ok(interception) => interception,
+            Err(_) => {
+                self.diagnostics
+                    .stanza_interception_panics
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!("Plugin `{}` stanza interceptor panicked", self.plugin_id);
+                Interception::Pass
+            }
+        }
+    }
+
+    fn intercept_scoped(&self, node: &OwnedNodeRef, scope: &InterceptionScope) -> Interception {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.inner.intercept_scoped(node, scope)
+        })) {
             Ok(interception) => interception,
             Err(_) => {
                 self.diagnostics
@@ -2151,6 +2268,17 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginPlanError> {
             version: manifest.version.clone(),
         });
     }
+    if manifest.capabilities.contains(PluginCapability::IqReply)
+        && !manifest
+            .capabilities
+            .contains(PluginCapability::StanzaInterception)
+    {
+        return Err(PluginPlanError::MissingCapabilityDependency {
+            plugin_id: manifest.id.clone(),
+            capability: PluginCapability::IqReply,
+            required: PluginCapability::StanzaInterception,
+        });
+    }
     Ok(())
 }
 
@@ -2515,6 +2643,7 @@ impl PluginHost {
                     resources: Arc::clone(&resources),
                     plugin_id,
                     diagnostics: Arc::clone(&diagnostics),
+                    iq_reply_allowed: capabilities.contains(PluginCapability::IqReply),
                 }),
             plugin_events: self
                 .event_router
@@ -3313,6 +3442,7 @@ mod tests {
             PluginCapability::PluginEvents,
             PluginCapability::StanzaInterception,
             PluginCapability::ClientInfo,
+            PluginCapability::IqReply,
         ];
         let combined = capabilities
             .into_iter()
@@ -4003,6 +4133,36 @@ mod tests {
         ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
+    }
+
+    #[test]
+    fn iq_reply_requires_stanza_interception_at_plan_time() {
+        let manifest = PluginManifest::new("reply-extension", "0.1.0")
+            .with_capability(PluginCapability::IqReply);
+        let invalid = PluginPlan::prepare(vec![PluginRegistration::new(FixedManifestPlugin::<6>(
+            manifest.clone(),
+        ))]);
+        assert!(matches!(
+            invalid,
+            Err(PluginPlanError::MissingCapabilityDependency {
+                ref plugin_id,
+                capability: PluginCapability::IqReply,
+                required: PluginCapability::StanzaInterception,
+            }) if plugin_id == "reply-extension"
+        ));
+
+        let paired = PluginPlan::prepare(vec![PluginRegistration::new(FixedManifestPlugin::<6>(
+            manifest.with_capability(PluginCapability::StanzaInterception),
+        ))])
+        .expect("declared reply requirements")
+        .expect("nonempty plugin plan");
+        assert_eq!(paired.ordered.len(), 1);
+
+        let outbound_only =
+            PluginPlan::prepare(vec![PluginRegistration::new(FixedManifestPlugin::<6>(
+                PluginManifest::new("outbound-only", "0.1.0").with_capability(PluginCapability::Iq),
+            ))]);
+        assert!(matches!(outbound_only, Ok(Some(_))));
     }
 
     struct PanickingManifestPlugin;
