@@ -87,7 +87,19 @@ impl<T> Drop for DrainingReceiver<T> {
     }
 }
 
-pub(crate) const CHAT_QUEUE_ITEMS: usize = 64;
+// Raised from the upstream 64, which is too small to absorb the offline
+// backlog a companion device is sent when it reconnects after being down for
+// a while: a busy group alone replays thousands of stanzas as fast as the
+// socket delivers them, the lane fills, and `drain_overloaded_inbound` closes
+// admissions and reconnects. The server then redelivers the same burst, so
+// the client never gets through it.
+//
+// Deliberately still bounded, and deliberately below what the byte budgets
+// allow (~3 MB of typical text stanzas against a 16 MiB lane), so those stay
+// the real backstop and buffered memory is capped at GLOBAL_CHAT_BYTES
+// however large the backlog is. `async_channel::bounded` preallocates its
+// slot ring, so this is also what a live lane costs up front.
+pub(crate) const CHAT_QUEUE_ITEMS: usize = 4096;
 pub(crate) const CHAT_BYTES: usize = 16 * 1024 * 1024;
 const GLOBAL_CHAT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const ACK_QUEUE_ITEMS: usize = 256;
